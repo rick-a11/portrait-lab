@@ -9,6 +9,24 @@ uses GFPGAN in an isolated Python environment; optional portrait animation uses
 the official LivePortrait runtime in a separate environment. Photos, results,
 model weights, and driving videos remain on the Mac that runs the service.
 
+## Interface
+
+<p align="center">
+  <img src="docs/images/portrait-lab-workspace.png" alt="Portrait Lab local restoration workspace" width="920" />
+</p>
+
+<p align="center">
+  <em>Local-first restoration workspace — no browser chrome, account information, or personal uploads are shown.</em>
+</p>
+
+<p align="center">
+  <img src="docs/images/portrait-lab-motion-library.png" alt="Portrait Lab LivePortrait motion library" width="920" />
+</p>
+
+<p align="center">
+  <em>Consent-based motion selection with the credited upstream sample library.</em>
+</p>
+
 ## What it does
 
 - Restore JPG, PNG, and WebP images with a 1×–4× GFPGAN workflow.
@@ -48,7 +66,7 @@ brew install uv ffmpeg
 ### 1. Clone and prepare GFPGAN
 
 ```bash
-git clone https://github.com/rick-a11/-python-Vue-GFPGAN-.git portrait-lab
+git clone https://github.com/rick-a11/portrait-lab.git
 cd portrait-lab
 ./scripts/bootstrap-gfpgan-macos.sh
 ```
