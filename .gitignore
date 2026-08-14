@@ -1,0 +1,32 @@
+# macOS and editor state
+.DS_Store
+.idea/
+.vscode/
+
+# JavaScript dependencies and build output
+**/node_modules/
+frontend/dist/
+
+# Python environments and generated files
+.venv*/
+.runtime/
+**/__pycache__/
+*.py[cod]
+backend/runtime/
+
+# Model weights, local media, and local configuration
+models/*
+!models/.gitkeep
+*.pth
+*.onnx
+*.ckpt
+*.safetensors
+*.mp4
+*.mov
+*.webm
+.env
+.env.*
+!.env.example
+
+# Hosting-provider metadata is local to a deployment, not the open-source app.
+.openai/
