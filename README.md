@@ -56,12 +56,15 @@ Vue 3 + Vite (localhost:5173)
 - macOS on Apple Silicon or Intel
 - [Homebrew](https://brew.sh/)
 - Node.js 20 or newer
+- Internet access for the first bootstrap (the upstream model downloads are several GB)
 
-Install the two system tools used by the setup scripts:
+Install the system tools used by the setup scripts:
 
 ```bash
-brew install uv ffmpeg
+brew install node uv ffmpeg
 ```
+
+If `git` is not available yet, run `xcode-select --install` once and accept the macOS Command Line Tools prompt.
 
 ### 1. Clone and prepare GFPGAN
 
@@ -71,8 +74,9 @@ cd portrait-lab
 ./scripts/bootstrap-gfpgan-macos.sh
 ```
 
-Download the official `GFPGANv1.4.pth` weight into `models/`, as described in
-[docs/MODELS.md](docs/MODELS.md). Model files are deliberately ignored by Git.
+The bootstrap creates the isolated Python 3.10 environment and downloads the official
+GFPGAN weight plus the required FaceXLib detection and parsing weights. They are
+stored only in ignored local directories; no manual model-file hunt is required.
 
 ### 2. Prepare optional animation support
 
@@ -111,6 +115,21 @@ If port 5000 is busy, the service safely selects 5001–5003 and records the
 actual port in `.runtime/portrait-lab-api.port`. The frontend automatically
 checks the same port range.
 
+## Clean-machine full reproducibility
+
+A fresh macOS installation can reproduce every local feature without copying
+any files from this repository owner:
+
+1. Install Homebrew, then run `brew install node uv ffmpeg`.
+2. Clone this repository and run `./scripts/bootstrap-gfpgan-macos.sh`. This prepares Python 3.10 and retrieves the three official GFPGAN/FaceXLib weights.
+3. Run `./scripts/bootstrap-liveportrait-macos.sh` to retrieve the official LivePortrait source, its weights, and the upstream sample driving clips.
+4. Start the API with `./scripts/portrait-lab-service.zsh start`, then run `cd frontend && npm ci && npm run dev` in a second Terminal.
+
+Model weights and driving clips are intentionally excluded from Git because they
+remain governed by their upstream licenses. The scripts fetch them from the
+original publishers into ignored local paths, so a checkout stays small and
+private media never needs to be uploaded. See [docs/MODELS.md](docs/MODELS.md)
+for the exact upstream sources.
 ## Reusable local controls
 
 Run these commands from the repository root whenever you need them:
