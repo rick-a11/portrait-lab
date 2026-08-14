@@ -139,6 +139,10 @@ Clips.command` in the repository root.
 - Review the licenses and acceptable-use terms of every upstream dependency
   before commercial or production deployment.
 
+## Contributors
+
+- [HaoLin Xue](https://github.com/jiang-you-si) — early development contributor.
+
 ## Credits
 
 Portrait Lab is grateful to the upstream projects that make the local workflow
