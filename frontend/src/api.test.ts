@@ -1,6 +1,36 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { animatePortrait, connectLocalApi, localApiOrigins, resolveApiUrl, restorePhoto } from "./api";
+import {
+  ApiError,
+  animatePortrait,
+  connectLocalApi,
+  localApiOrigins,
+  resolveApiUrl,
+  restorePhoto,
+  waitForJob,
+  type Job,
+  type RestoreResult,
+} from "./api";
+
+function job<TResult>(overrides: Partial<Job<TResult>> & Pick<Job<TResult>, "id">): Job<TResult> {
+  return {
+    kind: "restore",
+    status: "queued",
+    createdAt: "2026-10-26T00:00:00.000Z",
+    startedAt: null,
+    finishedAt: null,
+    queuePosition: 0,
+    error: null,
+    result: null,
+    ...overrides,
+  };
+}
+
+function jsonResponse(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+const noWait = () => Promise.resolve();
 
 describe("resolveApiUrl", () => {
   it("joins an API origin and path without duplicate slashes", () => {
@@ -73,29 +103,39 @@ describe("resolveApiUrl", () => {
     expect(connection.origin).toBe("http://127.0.0.1:5001");
   });
 
-  it("sends the selected image and scale to the restoration endpoint", async () => {
+  it("submits the image and scale, then polls the job until the restoration completes", async () => {
     const file = new File(["pixel"], "portrait.png", { type: "image/png" });
-    const fetcher = vi.fn().mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          job: { id: "job-1", status: "completed" },
-          model: { mode: "preview", ready: true },
-          resultUrl: "/media/results/job-1.png",
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ job: job({ id: "job-1", queuePosition: 1 }) }, 202))
+      .mockResolvedValueOnce(jsonResponse({ job: job({ id: "job-1", status: "running", queuePosition: null }) }))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          job: job<RestoreResult>({
+            id: "job-1",
+            status: "completed",
+            queuePosition: null,
+            result: { model: { mode: "preview", ready: true }, resultUrl: "/media/results/job-1.png" },
+          }),
         }),
-        { status: 201, headers: { "content-type": "application/json" } },
-      ),
-    );
+      );
+    const updates: string[] = [];
 
     const result = await restorePhoto(file, 2, {
       origin: "https://api.example.test/",
       fetcher,
+      sleep: noWait,
+      onUpdate: (update) => updates.push(`${update.status}:${update.queuePosition}`),
     });
 
-    expect(result.job.id).toBe("job-1");
-    expect(fetcher).toHaveBeenCalledWith(
+    expect(result.resultUrl).toBe("/media/results/job-1.png");
+    expect(updates).toEqual(["queued:1", "running:null", "completed:null"]);
+    expect(fetcher).toHaveBeenNthCalledWith(
+      1,
       "https://api.example.test/api/restore",
       expect.objectContaining({ method: "POST" }),
     );
+    expect(fetcher).toHaveBeenNthCalledWith(2, "https://api.example.test/api/jobs/job-1");
     const options = fetcher.mock.calls[0][1] as RequestInit;
     const sent = options.body as FormData;
     expect(sent.get("image")).toBe(file);
@@ -105,13 +145,19 @@ describe("resolveApiUrl", () => {
   it("sends the source image and chosen motion to the animation endpoint", async () => {
     const file = new File(["pixel"], "portrait.png", { type: "image/png" });
     const fetcher = vi.fn().mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          job: { id: "animation-1", status: "completed" },
-          animation: { mode: "liveportrait", ready: true },
-          resultUrl: "/media/animations/animation-1/result.mp4",
-        }),
-        { status: 201, headers: { "content-type": "application/json" } },
+      jsonResponse(
+        {
+          job: job({
+            id: "animation-1",
+            kind: "animate",
+            status: "completed",
+            result: {
+              animation: { mode: "liveportrait", ready: true },
+              resultUrl: "/media/animations/animation-1/result.mp4",
+            },
+          }),
+        },
+        202,
       ),
     );
 
@@ -120,7 +166,8 @@ describe("resolveApiUrl", () => {
       fetcher,
     });
 
-    expect(result.job.id).toBe("animation-1");
+    expect(result.resultUrl).toBe("/media/animations/animation-1/result.mp4");
+    expect(fetcher).toHaveBeenCalledTimes(1);
     expect(fetcher).toHaveBeenCalledWith(
       "https://api.example.test/api/animate",
       expect.objectContaining({ method: "POST" }),
@@ -136,13 +183,19 @@ describe("resolveApiUrl", () => {
     const image = new File(["portrait"], "portrait.png", { type: "image/png" });
     const drivingVideo = new File(["motion"], "my-motion.mp4", { type: "video/mp4" });
     const fetcher = vi.fn().mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          job: { id: "animation-2", status: "completed" },
-          animation: { mode: "liveportrait", ready: true },
-          resultUrl: "/media/animations/animation-2/result.mp4",
-        }),
-        { status: 201, headers: { "content-type": "application/json" } },
+      jsonResponse(
+        {
+          job: job({
+            id: "animation-2",
+            kind: "animate",
+            status: "completed",
+            result: {
+              animation: { mode: "liveportrait", ready: true },
+              resultUrl: "/media/animations/animation-2/result.mp4",
+            },
+          }),
+        },
+        202,
       ),
     );
 
@@ -153,5 +206,79 @@ describe("resolveApiUrl", () => {
     expect(sent.get("image")).toBe(image);
     expect(sent.get("motionId")).toBeNull();
     expect(sent.get("drivingVideo")).toBe(drivingVideo);
+  });
+
+  it("reports a rejected submission without polling", async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ error: { code: "queue_full", message: "任务队列已满" } }, 429));
+
+    const attempt = restorePhoto(new File(["pixel"], "portrait.png"), 2, { origin: "", fetcher, sleep: noWait });
+
+    await expect(attempt).rejects.toMatchObject({ status: 429, code: "queue_full" });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("waitForJob", () => {
+  it("throws the job's error when it fails", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      jsonResponse({
+        job: job({
+          id: "job-2",
+          kind: "animate",
+          status: "failed",
+          error: { code: "animation_failed", message: "动态生成失败" },
+        }),
+      }),
+    );
+
+    const error = await waitForJob(job({ id: "job-2", status: "running" }), {
+      origin: "",
+      fetcher,
+      sleep: noWait,
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ message: "动态生成失败", code: "animation_failed" });
+  });
+
+  it("keeps polling through brief network failures because the job runs on the server", async () => {
+    const fetcher = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("Network error"))
+      .mockRejectedValueOnce(new TypeError("Network error"))
+      .mockResolvedValueOnce(
+        jsonResponse({ job: job({ id: "job-3", status: "completed", result: { resultUrl: "/media/results/job-3.png" } }) }),
+      );
+
+    const result = await waitForJob<{ resultUrl: string }>(job({ id: "job-3" }), {
+      origin: "",
+      fetcher,
+      sleep: noWait,
+    });
+
+    expect(result.resultUrl).toBe("/media/results/job-3.png");
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
+  it("gives up after too many consecutive network failures", async () => {
+    const fetcher = vi.fn().mockRejectedValue(new TypeError("Network error"));
+
+    const attempt = waitForJob(job({ id: "job-4" }), { origin: "", fetcher, sleep: noWait, maxNetworkErrors: 2 });
+
+    await expect(attempt).rejects.toBeInstanceOf(TypeError);
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
+  it("stops immediately when the server no longer knows the job", async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ error: { code: "job_not_found", message: "没有找到这个任务。" } }, 404));
+
+    const attempt = waitForJob(job({ id: "job-5" }), { origin: "", fetcher, sleep: noWait });
+
+    await expect(attempt).rejects.toMatchObject({ status: 404, code: "job_not_found" });
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
 });

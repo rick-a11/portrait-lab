@@ -9,6 +9,7 @@ import {
   getMotions,
   resolveApiUrl,
   restorePhoto,
+  type Job,
   type ModelStatus,
   type MotionResponse,
 } from "./api";
@@ -51,6 +52,7 @@ const restoreErrorMessage = ref("");
 const animationErrorMessage = ref("");
 const restoreStatusMessage = ref("正在检查本地模型服务…");
 const animationStatusMessage = ref("正在检查动态模型服务…");
+const animationJobMessage = ref("");
 const scale = ref(2);
 const dragActive = ref(false);
 const consentConfirmed = ref(false);
@@ -222,6 +224,11 @@ function stopMotionPreview(event: Event) {
   video.currentTime = 0;
 }
 
+function jobProgressMessage(job: Job<unknown>, runningMessage: string) {
+  if (job.status !== "queued") return runningMessage;
+  return job.queuePosition ? `已进入队列，前面还有 ${job.queuePosition} 个任务…` : "已进入队列，即将开始…";
+}
+
 async function refreshConnection() {
   connectionState.value = "checking";
   try {
@@ -256,8 +263,14 @@ async function processPhoto() {
 
   processingState.value = "processing";
   restoreErrorMessage.value = "";
+  restoreStatusMessage.value = "正在提交任务…";
   try {
-    const response = await restorePhoto(selectedFile.value, scale.value, { origin: apiOrigin.value });
+    const response = await restorePhoto(selectedFile.value, scale.value, {
+      origin: apiOrigin.value,
+      onUpdate: (job) => {
+        restoreStatusMessage.value = jobProgressMessage(job, "正在修复照片…");
+      },
+    });
     sourceUrl.value = resolveApiUrl(response.sourceUrl || "", apiOrigin.value);
     resultUrl.value = resolveApiUrl(response.resultUrl, apiOrigin.value);
     model.value = response.model;
@@ -277,11 +290,17 @@ async function generateAnimation() {
 
   animationState.value = "processing";
   animationErrorMessage.value = "";
+  animationJobMessage.value = "正在提交任务…";
   try {
     const driver = customDrivingVideo.value
       ? { drivingVideo: customDrivingVideo.value }
       : { motionId: selectedMotion.value as string };
-    const response = await animatePortrait(selectedFile.value, driver, { origin: apiOrigin.value });
+    const response = await animatePortrait(selectedFile.value, driver, {
+      origin: apiOrigin.value,
+      onUpdate: (job) => {
+        animationJobMessage.value = jobProgressMessage(job, "本机首次生成通常需要几分钟。");
+      },
+    });
     animation.value = response.animation;
     animationResultUrl.value = resolveApiUrl(response.resultUrl, apiOrigin.value);
     animationStatusMessage.value = response.message || "动态短片已生成。";
@@ -535,7 +554,7 @@ onBeforeUnmount(() => {
         <div class="motion-status">
           <span class="mode-badge" :class="`is-${animationTone}`">{{ animationLabel }}</span>
           <strong class="selected-driving-label">已选：{{ selectedDrivingLabel }}</strong>
-          <p v-if="animationState === 'processing'">正在根据“{{ selectedDrivingLabel }}”生成短片；本机首次生成通常需要几分钟。</p>
+          <p v-if="animationState === 'processing'">正在根据“{{ selectedDrivingLabel }}”生成短片；{{ animationJobMessage }}</p>
           <p v-else-if="animationState === 'complete'">{{ animationStatusMessage }}</p>
           <p v-else-if="animationState === 'error'" class="is-error">{{ animationErrorMessage }}</p>
           <p v-else>上传同一张照片、选择动作并确认授权后，即可生成短片。</p>

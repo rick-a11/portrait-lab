@@ -14,22 +14,40 @@ export type HealthResponse = {
   status: "ok";
   model: ModelStatus;
   animation?: ModelStatus;
+  jobs?: { maxPending: number; kinds: Record<string, JobLoad> };
 };
 
-export type RestoreResponse = {
-  job: { id: string; status: "completed" };
+export type JobStatus = "queued" | "running" | "completed" | "failed";
+
+export type Job<TResult> = {
+  id: string;
+  kind: "restore" | "animate";
+  status: JobStatus;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  /** Jobs of the same kind queued ahead of this one; null once it has started. */
+  queuePosition: number | null;
+  error: { code: string; message: string } | null;
+  result: TResult | null;
+};
+
+export type JobResponse<TResult> = { job: Job<TResult> };
+
+export type RestoreResult = {
   model: ModelStatus;
   message?: string;
   sourceUrl?: string;
   resultUrl: string;
 };
 
-export type AnimateResponse = {
-  job: { id: string; status: "completed" };
+export type AnimateResult = {
   animation: ModelStatus;
   message?: string;
   resultUrl: string;
 };
+
+export type JobLoad = { concurrency: number; queued: number; running: number };
 
 export type MotionResponse = {
   scope: "local";
@@ -46,7 +64,21 @@ export type AnimationDriver = { motionId: string } | { drivingVideo: File };
 
 export type Fetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
+export type JobWatchOptions<TResult> = {
+  origin?: string;
+  fetcher?: Fetcher;
+  intervalMs?: number;
+  /** Consecutive network failures tolerated while polling; the job keeps running on the server. */
+  maxNetworkErrors?: number;
+  onUpdate?: (job: Job<TResult>) => void;
+  sleep?: (ms: number) => Promise<void>;
+};
+
 const LOCAL_API_PROBE_TIMEOUT_MS = 1_500;
+const DEFAULT_POLL_INTERVAL_MS = 1_000;
+const DEFAULT_MAX_NETWORK_ERRORS = 5;
+
+const wait = (ms: number) => new Promise<void>((resolve) => globalThis.setTimeout(resolve, ms));
 
 export class ApiError extends Error {
   constructor(
@@ -135,29 +167,72 @@ export async function getMotions(
   return decode<MotionResponse>(await fetcher(resolveApiUrl("/api/motions", origin)));
 }
 
-export async function restorePhoto(
+export async function getJob<TResult>(
+  jobId: string,
+  options: { origin?: string; fetcher?: Fetcher } = {},
+): Promise<Job<TResult>> {
+  const origin = options.origin ?? defaultApiOrigin();
+  const fetcher = options.fetcher ?? fetch;
+  const response = await decode<JobResponse<TResult>>(
+    await fetcher(resolveApiUrl(`/api/jobs/${encodeURIComponent(jobId)}`, origin)),
+  );
+  return response.job;
+}
+
+/** Poll a job until it finishes; resolves with its result or throws its error as an ApiError. */
+export async function waitForJob<TResult>(
+  job: Job<TResult>,
+  options: JobWatchOptions<TResult> = {},
+): Promise<TResult> {
+  const intervalMs = options.intervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+  const maxNetworkErrors = options.maxNetworkErrors ?? DEFAULT_MAX_NETWORK_ERRORS;
+  const sleep = options.sleep ?? wait;
+  let current = job;
+  let networkErrors = 0;
+  options.onUpdate?.(current);
+
+  while (current.status === "queued" || current.status === "running") {
+    await sleep(intervalMs);
+    try {
+      current = await getJob<TResult>(current.id, options);
+      networkErrors = 0;
+    } catch (error) {
+      if (error instanceof ApiError || ++networkErrors > maxNetworkErrors) throw error;
+      continue;
+    }
+    options.onUpdate?.(current);
+  }
+
+  if (current.status === "failed" || !current.result) {
+    throw new ApiError(current.error?.message || "任务没有成功完成。", 200, current.error?.code);
+  }
+  return current.result;
+}
+
+export async function submitRestore(
   image: File,
   scale: number,
   options: { origin?: string; fetcher?: Fetcher } = {},
-): Promise<RestoreResponse> {
+): Promise<Job<RestoreResult>> {
   const origin = options.origin ?? defaultApiOrigin();
   const fetcher = options.fetcher ?? fetch;
   const formData = new FormData();
   formData.append("image", image);
   formData.append("scale", String(scale));
-  return decode<RestoreResponse>(
+  const response = await decode<JobResponse<RestoreResult>>(
     await fetcher(resolveApiUrl("/api/restore", origin), {
       method: "POST",
       body: formData,
     }),
   );
+  return response.job;
 }
 
-export async function animatePortrait(
+export async function submitAnimation(
   image: File,
   driver: AnimationDriver,
   options: { origin?: string; fetcher?: Fetcher } = {},
-): Promise<AnimateResponse> {
+): Promise<Job<AnimateResult>> {
   const origin = options.origin ?? defaultApiOrigin();
   const fetcher = options.fetcher ?? fetch;
   const formData = new FormData();
@@ -167,10 +242,27 @@ export async function animatePortrait(
   } else {
     formData.append("drivingVideo", driver.drivingVideo);
   }
-  return decode<AnimateResponse>(
+  const response = await decode<JobResponse<AnimateResult>>(
     await fetcher(resolveApiUrl("/api/animate", origin), {
       method: "POST",
       body: formData,
     }),
   );
+  return response.job;
+}
+
+export async function restorePhoto(
+  image: File,
+  scale: number,
+  options: JobWatchOptions<RestoreResult> = {},
+): Promise<RestoreResult> {
+  return waitForJob(await submitRestore(image, scale, options), options);
+}
+
+export async function animatePortrait(
+  image: File,
+  driver: AnimationDriver,
+  options: JobWatchOptions<AnimateResult> = {},
+): Promise<AnimateResult> {
+  return waitForJob(await submitAnimation(image, driver, options), { intervalMs: 2_000, ...options });
 }

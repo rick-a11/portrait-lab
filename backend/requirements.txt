@@ -1,3 +1,4 @@
 Flask>=3.1,<4
 Flask-Cors>=5,<6
 Pillow>=10,<12
+mcp>=2.3,<3
