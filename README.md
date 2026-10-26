@@ -98,10 +98,12 @@ How the queue behaves:
   SQL statement, so concurrent submissions cannot overshoot it.
 - **Persistence.** Jobs live in SQLite (`backend/runtime/jobs.sqlite3`, WAL
   mode; override with `JOB_DB_PATH`). After a restart, queued jobs resume
-  automatically and finished jobs keep their results. A job that was running
-  when the process stopped is marked `failed` with code `interrupted` rather
-  than retried, so one input that crashes the process cannot crash it again in
-  a loop.
+  automatically and finished jobs keep their results. Each running job records
+  the process that claimed it, and that process holds an OS file lock for as
+  long as it lives. On startup, a running job whose process is gone is marked
+  `failed` with code `interrupted` rather than retried, so one input that
+  crashes the process cannot crash it again in a loop. Jobs owned by a process
+  that is still alive are left alone.
 - **Private clips stay single-use.** A custom driving video is deleted when its
   job ends, whether it completes, fails, or is interrupted.
 
@@ -256,9 +258,12 @@ the result is"* or *"Animate that photo with the 轻快笑容 motion — I own t
 photo"*. The agent checks `health_check`, calls the tools, and polls `get_job`
 until a long animation finishes.
 
-The MCP server keeps its own job table (`backend/runtime/mcp-jobs.sqlite3`)
-so it never marks the HTTP API's running jobs as interrupted. Concurrency
-limits apply per process.
+The MCP server keeps its own job table (`backend/runtime/mcp-jobs.sqlite3`),
+so the HTTP API's workers never pick up its jobs. Each MCP client starts its
+own server process. Those processes can share the table, for example Claude
+Desktop and Claude Code at the same time, because a running job is treated as
+interrupted only after the process that owns it has exited. Concurrency limits
+apply per process.
 
 ## Privacy and responsible use
 

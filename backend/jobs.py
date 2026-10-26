@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import queue
@@ -36,7 +37,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at REAL NOT NULL,
     started_at REAL,
     finished_at REAL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    owner TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_by_kind_and_status ON jobs (kind, status);
 """
@@ -68,10 +70,47 @@ class Job:
     started_at: float | None
     finished_at: float | None
     updated_at: float
+    owner: str | None = None
 
     @property
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES
+
+
+class OwnerLock:
+    """An exclusive ``flock`` held by a process for as long as it runs jobs.
+
+    The kernel drops the lock when its process exits, even on SIGKILL, so a
+    lock that someone else can take means the process that took it is gone.
+    """
+
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self._handle = path.open("ab")
+        fcntl.flock(self._handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def release(self) -> None:
+        if self._handle.closed:
+            return
+        self.path.unlink(missing_ok=True)
+        fcntl.flock(self._handle, fcntl.LOCK_UN)
+        self._handle.close()
+
+    @staticmethod
+    def is_held(path: Path) -> bool:
+        """True while a live process holds the lock at ``path``; a stale lock file is removed."""
+        try:
+            handle = path.open("rb")
+        except FileNotFoundError:
+            return False
+        with handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            path.unlink(missing_ok=True)
+            return False
 
 
 def _job_from_row(row: sqlite3.Row) -> Job:
@@ -87,6 +126,7 @@ def _job_from_row(row: sqlite3.Row) -> Job:
         started_at=row["started_at"],
         finished_at=row["finished_at"],
         updated_at=row["updated_at"],
+        owner=row["owner"],
     )
 
 
@@ -159,12 +199,12 @@ class JobStore:
             rows = connection.execute("SELECT * FROM jobs WHERE status = ? ORDER BY rowid", (status,)).fetchall()
         return [_job_from_row(row) for row in rows]
 
-    def claim(self, job_id: str, *, now: float) -> Job | None:
-        """Move a queued job to running; ``None`` means someone else already took it."""
+    def claim(self, job_id: str, *, now: float, owner: str | None = None) -> Job | None:
+        """Move a queued job to running for ``owner``; ``None`` means someone else already took it."""
         with self._transaction() as connection:
             cursor = connection.execute(
-                "UPDATE jobs SET status = ?, started_at = ?, updated_at = ? WHERE id = ? AND status = ?",
-                (RUNNING, now, now, job_id, QUEUED),
+                "UPDATE jobs SET status = ?, started_at = ?, updated_at = ?, owner = ? WHERE id = ? AND status = ?",
+                (RUNNING, now, now, owner, job_id, QUEUED),
             )
             if cursor.rowcount != 1:
                 return None
@@ -234,9 +274,12 @@ class JobManager:
 
     Each kind gets its own pool so a 20-minute LivePortrait render never
     blocks a few-second restoration. Workers are daemon threads: stopping the
-    service never waits for a model, and anything left ``running`` is marked
-    interrupted by ``recover()`` on the next start instead of being retried,
-    so a job that crashes the process cannot crash it again in a loop.
+    service never waits for a model. Each running job records the process
+    that claimed it, and that process holds an ``OwnerLock`` while it lives.
+    ``recover()`` marks a running job interrupted only once its owner is gone,
+    instead of retrying it, so a job that crashes the process cannot crash it
+    again in a loop, and a second process sharing the table (two MCP clients,
+    say) never interrupts the first one's live work.
     """
 
     def __init__(
@@ -259,6 +302,8 @@ class JobManager:
         self._closed = False
         self._changed = threading.Condition()
         self._version = 0
+        self.owner = uuid4().hex
+        self._owner_lock: OwnerLock | None = None
 
     @property
     def version(self) -> int:
@@ -299,8 +344,10 @@ class JobManager:
         }
 
     def recover(self) -> None:
-        """Resume queued jobs and fail jobs that a previous process left running."""
+        """Resume queued jobs and fail running jobs whose process has exited."""
         for job in self.store.with_status(RUNNING):
+            if job.owner and OwnerLock.is_held(self._owner_lock_path(job.owner)):
+                continue
             if self.store.finish(
                 job.id,
                 FAILED,
@@ -343,6 +390,22 @@ class JobManager:
                 pending.put(None)
         for worker in workers:
             worker.join(timeout)
+        with self._lock:
+            owner_lock, self._owner_lock = self._owner_lock, None
+        if owner_lock is not None:
+            # From here on, another process may treat this one's unfinished jobs as interrupted.
+            owner_lock.release()
+
+    def _owner_lock_path(self, owner: str) -> Path:
+        return self.store.path.with_name(f"{self.store.path.name}.owners") / f"{owner}.lock"
+
+    def _claim(self, job_id: str) -> Job | None:
+        with self._lock:
+            if self._closed:
+                return None
+            if self._owner_lock is None:
+                self._owner_lock = OwnerLock(self._owner_lock_path(self.owner))
+        return self.store.claim(job_id, now=self._clock(), owner=self.owner)
 
     def _dispatch(self, kind: str, job_id: str) -> None:
         with self._lock:
@@ -374,7 +437,7 @@ class JobManager:
                 LOGGER.exception("Worker could not record job %s", job_id)
 
     def _execute(self, job_id: str) -> None:
-        job = self.store.claim(job_id, now=self._clock())
+        job = self._claim(job_id)
         if job is None:
             return
         self._notify()

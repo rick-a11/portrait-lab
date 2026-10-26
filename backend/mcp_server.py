@@ -172,7 +172,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(name)s %(message)s")
     config = runtime_config()
     if config["JOB_DB_PATH"] is None:
-        # A job table of its own keeps this process from marking the HTTP API's running jobs as interrupted.
+        # MCP jobs get a table of their own so the HTTP API's workers never pick them up. Servers
+        # started by different MCP clients share it safely: recover() skips jobs whose owner is alive.
         config["JOB_DB_PATH"] = Path(config["STORAGE_DIR"]) / "mcp-jobs.sqlite3"
     service = PortraitService.from_config(config)
     try:
