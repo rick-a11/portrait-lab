@@ -36,18 +36,74 @@ model weights, and driving videos remain on the Mac that runs the service.
   LivePortrait.
 - Browse local LivePortrait sample clips as named preview cards, or provide an
   authorized MP4, MOV, or WebM clip for a single job.
+- Run restoration and animation as persistent background jobs: the API
+  answers in milliseconds with a job id, the UI polls (or listens over SSE),
+  and job state survives an API restart.
+- Let AI agents such as Claude Desktop and Claude Code restore and animate
+  portraits through a local [MCP server](#use-portrait-lab-from-an-ai-agent-mcp).
 - Run the model API only on `127.0.0.1`; uploads and generated media are not
   sent to a hosted service by this project.
 
 ## Architecture
 
 ```text
-Vue 3 + Vite (localhost:5173)
-          │
-          ├── GFPGAN restoration API ── isolated Python 3.10 environment
-          │
-          └── LivePortrait animation ── separate Python 3.10 environment + FFmpeg
+Vue 3 + Vite (localhost:5173)          Claude Desktop / Claude Code
+          │  HTTP: submit → poll / SSE            │  MCP over stdio
+          ▼                                       ▼
+   Flask API (backend/app.py)          MCP server (backend/mcp_server.py)
+          └──────────────┬────────────────────────┘
+                         ▼
+          PortraitService (backend/service.py)
+          validation · UUID staging · private-clip cleanup
+                         ▼
+          JobManager + SQLite job table (backend/jobs.py)
+          per-kind worker pools · pending-job limit · restart recovery
+                ├── restore workers ── GFPGAN, isolated Python 3.10 environment
+                └── animate workers ── LivePortrait, separate Python 3.10 environment + FFmpeg
 ```
+
+## Background jobs
+
+LivePortrait can run for up to 20 minutes, so neither endpoint holds the HTTP
+request open while a model works:
+
+1. `POST /api/restore` or `POST /api/animate` validates the upload, copies it to
+   a UUID-named path, and answers `202 Accepted` with the job and a `Location`
+   header. Invalid input still fails immediately (`400`, `413`, `422`), and a
+   model that is not ready fails with `503` before anything is queued.
+2. `GET /api/jobs/<id>` returns the job's `status` (`queued`, `running`,
+   `completed`, or `failed`), its `queuePosition`, an `error` with a stable
+   `code`, and — once completed — the same `result` fields the synchronous API
+   used to return (`resultUrl`, `sourceUrl`, `model` or `animation`).
+3. `GET /api/jobs/<id>/events` streams the same payload as Server-Sent Events
+   until the job finishes, for clients that prefer push over polling.
+
+```bash
+curl -s -F image=@portrait.png -F scale=2 http://127.0.0.1:5000/api/restore
+curl -s http://127.0.0.1:5000/api/jobs/<job id>
+curl -N http://127.0.0.1:5000/api/jobs/<job id>/events
+```
+
+How the queue behaves:
+
+- **Isolated worker pools.** Restoration and animation each get their own
+  workers, so a long animation never delays a quick restoration.
+  `RESTORE_CONCURRENCY` (default `2`) and `ANIMATION_CONCURRENCY` (default `1`)
+  set the pool sizes. The GFPGAN and LivePortrait adapters still run one model
+  call at a time per process, so larger pools overlap file handling rather than
+  inference.
+- **Back-pressure.** Each kind accepts at most `MAX_PENDING_JOBS` (default
+  `16`) queued or running jobs; beyond that the API answers `429 queue_full`
+  and discards the rejected upload. The capacity check and the insert are one
+  SQL statement, so concurrent submissions cannot overshoot it.
+- **Persistence.** Jobs live in SQLite (`backend/runtime/jobs.sqlite3`, WAL
+  mode; override with `JOB_DB_PATH`). After a restart, queued jobs resume
+  automatically and finished jobs keep their results. A job that was running
+  when the process stopped is marked `failed` with code `interrupted` rather
+  than retried, so one input that crashes the process cannot crash it again in
+  a loop.
+- **Private clips stay single-use.** A custom driving video is deleted when its
+  job ends, whether it completes, fails, or is interrupted.
 
 ## macOS quick start
 
@@ -147,6 +203,63 @@ Finder users can instead double-click `Start Portrait Lab.command`, `Check
 Portrait Lab Status.command`, `Stop Portrait Lab.command`, or `Open Driving
 Clips.command` in the repository root.
 
+## Use Portrait Lab from an AI agent (MCP)
+
+`backend/mcp_server.py` exposes the same restoration and animation pipeline as
+[Model Context Protocol](https://modelcontextprotocol.io) tools, built on the
+official Python MCP SDK with the stdio transport. It calls the service layer
+directly — no HTTP server is needed — and shares its validation, storage, and
+cleanup rules.
+
+| Tool | What it does |
+| --- | --- |
+| `health_check` | Reports whether GFPGAN and LivePortrait are ready, plus queue load. |
+| `list_motions` | Lists the local driving clips; their `id` is accepted as `motion_id`. |
+| `restore_photo` | Restores an image at an absolute local path (scale 1–4) and, by default, waits for the result. Returns `result.resultPath`. |
+| `animate_portrait` | Queues an animation from a `motion_id` or the user's own `driving_video_path`. Requires `consent_confirmed: true` and returns a job id immediately. |
+| `get_job` | Long-polls a job for up to `wait_seconds` (max 300) and returns its status, error, or result paths. |
+
+Input files are copied into the runtime directory and never modified. While a
+tool waits, it sends MCP progress notifications as the job moves from queued to
+running to finished.
+
+Prepare the Python environment first (`./scripts/bootstrap-gfpgan-macos.sh`).
+Without the GFPGAN weight the server still starts and `restore_photo` runs in
+the clearly labeled preview mode.
+
+**Claude Code**
+
+```bash
+claude mcp add portrait-lab -- /ABSOLUTE/PATH/TO/portrait-lab/scripts/run-mcp-server.sh
+```
+
+**Claude Desktop** — add this to
+`~/Library/Application Support/Claude/claude_desktop_config.json`, then restart
+the app:
+
+```json
+{
+  "mcpServers": {
+    "portrait-lab": {
+      "command": "/ABSOLUTE/PATH/TO/portrait-lab/scripts/run-mcp-server.sh"
+    }
+  }
+}
+```
+
+Any other MCP client can launch the same script. To inspect the tools
+interactively, run
+`npx @modelcontextprotocol/inspector ./scripts/run-mcp-server.sh`.
+
+Then ask, for example: *"Restore ~/Pictures/grandma.jpg at 2× and tell me where
+the result is"* or *"Animate that photo with the 轻快笑容 motion — I own the
+photo"*. The agent checks `health_check`, calls the tools, and polls `get_job`
+until a long animation finishes.
+
+The MCP server keeps its own job table (`backend/runtime/mcp-jobs.sqlite3`)
+so it never marks the HTTP API's running jobs as interrupted. Concurrency
+limits apply per process.
+
 ## Privacy and responsible use
 
 - This repository contains no model weights, generated results, uploaded
@@ -154,7 +267,11 @@ Clips.command` in the repository root.
   machine-specific paths.
 - Use only images and driving material that you own or are authorized to use.
 - The custom driving-video upload is handled as a single local job and is
-  removed by the API after the model process completes.
+  removed after the job ends, including when it fails or is interrupted by a
+  restart. The MCP server applies the same rule to its private copy.
+- The MCP `animate_portrait` tool refuses to run unless the agent passes
+  `consent_confirmed: true` after the user confirms their rights to the
+  material.
 - Review the licenses and acceptable-use terms of every upstream dependency
   before commercial or production deployment.
 
@@ -178,8 +295,11 @@ Their licenses and notices continue to apply to their respective materials.
 ## Development checks
 
 ```bash
-# Backend routes, upload validation, CORS, and animation job behavior
+# Backend routes, upload validation, CORS, and background job behavior
 .venv-gfpgan/bin/python -m unittest backend.tests.test_api -v
+
+# Job store/manager unit tests and MCP tools (in-process and over stdio)
+.venv-gfpgan/bin/python -m unittest backend.tests.test_jobs backend.tests.test_mcp_server -v
 
 # Frontend unit tests, type checking, and production build
 cd frontend && npm test
