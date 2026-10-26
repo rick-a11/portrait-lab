@@ -153,7 +153,11 @@ class JobManagerTest(unittest.TestCase):
         private = self.root / "driving.mp4"
         private.write_bytes(b"clip")
         self.store.insert_if_capacity("crashed", "restore", {"ephemeral": [str(private)]}, limit=10, now=1.0)
-        self.store.claim("crashed", now=2.0)
+        self.store.claim("crashed", now=2.0, owner="gone")
+        # The dead process left its lock file behind, but nobody holds the lock any more.
+        stale_lock = self.root / "jobs.sqlite3.owners" / "gone.lock"
+        stale_lock.parent.mkdir()
+        stale_lock.touch()
         self.store.insert_if_capacity("waiting", "restore", {}, limit=10, now=3.0)
         ran: list[str] = []
 
@@ -166,7 +170,59 @@ class JobManagerTest(unittest.TestCase):
         self.assertEqual((resumed.status, resumed.result), (COMPLETED, {"resumed": True}))
         self.assertEqual((crashed.status, crashed.error_code), (FAILED, "interrupted"))
         self.assertFalse(private.exists())
+        self.assertFalse(stale_lock.exists())
         self.assertEqual(ran, ["waiting"])
+
+    def test_recover_leaves_jobs_of_a_live_process_running(self) -> None:
+        # Two MCP clients each start a server on the same job table.
+        release = threading.Event()
+        started = threading.Event()
+        private = self.root / "driving.mp4"
+        private.write_bytes(b"clip")
+
+        def hold(_: Job):
+            started.set()
+            release.wait(5)
+            return {"done": True}
+
+        first = self.manager(hold)
+        self.addCleanup(release.set)
+        job = first.submit("restore", {"ephemeral": [str(private)]})
+        self.assertTrue(started.wait(5))
+
+        second = self.manager(lambda _: {})
+        second.recover()
+
+        running = self.store.get(job.id)
+        assert running is not None
+        self.assertEqual((running.status, running.owner), (RUNNING, first.owner))
+        self.assertTrue(private.exists())
+        release.set()
+        finished = first.wait(job.id, timeout=5)
+        assert finished is not None
+        self.assertEqual((finished.status, finished.result), (COMPLETED, {"done": True}))
+        self.assertFalse(private.exists())
+
+    def test_closing_releases_ownership_of_unfinished_jobs(self) -> None:
+        release = threading.Event()
+        started = threading.Event()
+
+        def hold(_: Job):
+            started.set()
+            release.wait(5)
+            return {}
+
+        first = self.manager(hold)
+        self.addCleanup(release.set)
+        job = first.submit("restore", {})
+        self.assertTrue(started.wait(5))
+        first.close(timeout=0)
+
+        self.manager(lambda _: {}).recover()
+
+        interrupted = self.store.get(job.id)
+        assert interrupted is not None
+        self.assertEqual((interrupted.status, interrupted.error_code), (FAILED, "interrupted"))
 
     def test_wait_returns_the_latest_state_when_the_timeout_expires(self) -> None:
         release = threading.Event()

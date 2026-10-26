@@ -375,7 +375,9 @@ class JobQueueApiTest(ApiTestCase):
         self.assertTrue(blocked.started.acquire(timeout=5))
         waiting = self.submit_animation(first_client).get_json()["job"]["id"]
 
-        # A second process on the same storage simulates the API coming back after a crash.
+        # Simulate the first process crashing: the kernel would drop its owner lock.
+        # A second service on the same storage then plays the API coming back.
+        first_service.extensions["portrait_service"].jobs._owner_lock.release()
         restarted = self.make_app().test_client()
 
         job = restarted.get(f"/api/jobs/{interrupted}").get_json()["job"]
